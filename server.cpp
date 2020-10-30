@@ -143,7 +143,7 @@ void network_io(int id){
   epoll_event event; //struct for an epoll event, we'll add and it and then reuse it later for some other event as the original has already been added
   std::memset(&event, 0, sizeof(event));
 
-  event.events = EPOLLIN | EPOLLET; //so we want eventfd to be in level triggered mode
+  event.events = EPOLLIN | EPOLLET;
   event.data.fd = eventFd;
   if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventFd, &event) == -1){
     perror("epoll_ctl eventFd");
@@ -175,8 +175,7 @@ void network_io(int id){
           }
 
           itc_s data;
-          if(fromProcessingThread->try_dequeue(data)){
-            std::cout << "Payload: " << data.payload << " | On thread with ID: " << data.threadID << "\n";
+          if(fromProcessingThread->try_dequeue(data)){ //dequeue some data
             if(liveClientSockets.count(data.socketFd)){ //if it's a valid live client
               int writtenBytes = write(data.socketFd, &data.payload, sizeof(data.payload));
               if(writtenBytes == -1){
@@ -250,11 +249,11 @@ void network_io(int id){
           }else if(readBytes == 0){ //finished reading data
             break;
           }else{
-            buffer += tempBuffer;
+            buffer += tempBuffer; //append the read data to the buffer
           }
         }
 
-        toProcessingThread->try_enqueue(itc_s(buffer, events[i].data.fd, id));
+        toProcessingThread->try_enqueue(itc_s(buffer, events[i].data.fd, id)); //enqueue the buffer data and send it to the processing thread
       }
     }
   }
@@ -277,12 +276,58 @@ int main(){
   for(int i = 0; i < network_threads; i++){
     threadContainer[i] = std::thread(network_io, i);
   }
+  
+  int epoll_fd, event_count;
+
+  if((epoll_fd = epoll_create1(0)) == -1){
+    perror("Epoll couldn't be instantiated on the processing thread");
+    exit(1);
+  }
+
+  epoll_event event;
+  std::memset(&event, 0, sizeof(event));
+
+  event.events = EPOLLIN | EPOLLET;
+
+  epoll_event events[network_threads];
+  
+  for(int i = 0; i < network_threads; i++){
+    const auto eventFd = eventFdArrray[i];
+
+    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventFd, &event) == -1){
+      perror("epoll_ctl eventFd");
+      exit(1);
+    }
+  }
 
   while(true){
-    std::string payload;
-    std::getline(std::cin, payload);
-    int threadID = rand() % network_threads;
-    fromProcessingThreadArray[threadID].try_enqueue(itc_s(payload, 5, threadID));
-    write(eventFdArrray[threadID], &eventFdWriteVariable, sizeof(eventFdWriteVariable));
+    event_count = epoll_wait(epoll_fd, events, network_threads, -1);
+
+    for(int i = 0; i < event_count; i++){
+      while(true){
+        uint64_t readBytes;
+        int responseCode = read(events[i].data.fd, &readBytes, sizeof(readBytes));
+
+        if(responseCode < 0){
+          if(errno == EAGAIN || errno == EWOULDBLOCK){ //have read all data
+            break;
+          }
+        }
+
+        itc_s data;
+        if(toProcessingThreadArray[i].try_dequeue(data)){
+          /**
+           * 
+           * Process the data here however you wish
+           * 
+           * */
+          std::string someProcessedData = data.payload;
+
+          data.payload = someProcessedData;
+
+          fromProcessingThreadArray[i].try_enqueue(data); //sent back to the appropriate thread, for the appropriate socket
+        }
+      }
+    }
   }
 }
