@@ -52,18 +52,29 @@ typedef moodycamel::ReaderWriterQueue<itc_s> stringQueue;
 
 const auto network_threads = std::max((unsigned int)1, std::thread::hardware_concurrency()-1);
 
-int *eventFdArrray = nullptr;
+int *eventFdArray = nullptr;
 stringQueue *toProcessingThreadArray = nullptr;
 stringQueue *fromProcessingThreadArray = nullptr;
+
+struct { //used to synchronise processing thread setting up epoll for eventfd with the network threads, which need to make the eventfd's
+  const int eventFd = eventfd(0, 0);
+  int counter = 0;
+} wakeUpProcessingThread;
 
 void network_io(int id){
   const auto toProcessingThread = &toProcessingThreadArray[id];
   const auto fromProcessingThread = &fromProcessingThreadArray[id];
 
-  eventFdArrray[id] = eventfd(0, EFD_NONBLOCK);
-  const auto eventFd = eventFdArrray[id];
+  eventFdArray[id] = eventfd(0, EFD_NONBLOCK);
+  const auto eventFd = eventFdArray[id];
+  
+  wakeUpProcessingThread.counter++; //increment the counter, once it is equal to network thread then wake up the processing thread (if it's asleep), or just let it through
+  if(wakeUpProcessingThread.counter == network_threads){
+    uint64_t writeVariable = 1; //write this to the eventfd used to synchronise the threads
+    write(wakeUpProcessingThread.eventFd, &writeVariable, sizeof(writeVariable));
+  }
 
-  std::unordered_set<int> liveClientSockets;
+  std::unordered_set<int> liveClientSockets; //the set of live sockets in this thread
   
   //for the socket stuff
   int serverFd, clientFd;
@@ -265,7 +276,7 @@ int main(){
 
   toProcessingThreadArray = new stringQueue[network_threads];
   fromProcessingThreadArray = new stringQueue[network_threads];
-  eventFdArrray = new int[network_threads];
+  eventFdArray = new int[network_threads];
 
   /*
   * Use epoll for monitoring eventFdArrray in edge-triggered mode, read data and make all the eventFds non blocking
@@ -287,21 +298,36 @@ int main(){
   epoll_event event;
   std::memset(&event, 0, sizeof(event));
 
+  { //this scope is where we synchronise the network threads with this thread (the processing thread)
+    epoll_event singleEventEvents[1];
+
+    event.events = EPOLLIN;
+    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, wakeUpProcessingThread.eventFd, &event) == -1){
+      perror("global eventFd epoll_ctl failed");
+      exit(1);
+    }
+
+    epoll_wait(epoll_fd, singleEventEvents, 1, -1); //block on this thread until the eventFd is written to
+    
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, wakeUpProcessingThread.eventFd, &event); //delete the event explicitly as we no longer need it
+  }
+
   event.events = EPOLLIN | EPOLLET;
 
   epoll_event events[network_threads];
   
-  for(int i = 0; i < network_threads; i++){
-    const auto eventFd = eventFdArrray[i];
+  for(int i = 0; i < network_threads; i++){ //register the eventfds
+    const auto eventFd = eventFdArray[i];
+    event.data.fd = eventFd;
 
     if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventFd, &event) == -1){
-      perror("epoll_ctl eventFd");
+      perror("epoll_ctl in processing thread for the eventfds");
       exit(1);
     }
   }
 
   while(true){
-    event_count = epoll_wait(epoll_fd, events, network_threads, -1);
+    event_count = epoll_wait(epoll_fd, events, network_threads, -1); //wait for events through this
 
     for(int i = 0; i < event_count; i++){
       while(true){
