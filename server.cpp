@@ -17,6 +17,16 @@
 #define PORT "4000"
 #define BACKLOG 100
 
+/*
+ *
+ * 
+ * 
+ * Do something to deal with clients disconnecting
+ * 
+ * 
+ * 
+*/
+
 struct itc_s { //itc = inter thread communication struct
   itc_s(std::string payload = "", int socketFd = 0, int threadID = 0){
     this->payload = payload;
@@ -52,25 +62,49 @@ typedef moodycamel::ReaderWriterQueue<itc_s> stringQueue;
 
 const auto network_threads = std::max((unsigned int)1, std::thread::hardware_concurrency()-1);
 
-int *eventFdArray = nullptr;
+int *eventFdArrayToProcessingThread = nullptr;
+int *eventFdArrayFromProcessingThread = nullptr;
 stringQueue *toProcessingThreadArray = nullptr;
 stringQueue *fromProcessingThreadArray = nullptr;
+
+const uint64_t writeVariable = 1; //write this to the eventfd used to synchronise the threads
 
 struct { //used to synchronise processing thread setting up epoll for eventfd with the network threads, which need to make the eventfd's
   const int eventFd = eventfd(0, 0);
   int counter = 0;
 } wakeUpProcessingThread;
 
+void sendMessage(int socketFd, itc_s *data, std::unordered_map<int, std::string> *residualToSendData, int epoll_fd){
+  int writtenBytes = write(socketFd, data->payload.c_str(), data->payload.size());
+
+  if(writtenBytes == -1){
+    perror("write to client socket failed");
+    exit(1);
+  }else if(writtenBytes != data->payload.size()){
+    residualToSendData->insert({ socketFd, data->payload.substr(writtenBytes, data->payload.size()) }); //the remaining data is put into here
+    
+    epoll_event writeAgainEvent;
+    writeAgainEvent.data.fd = socketFd;
+    writeAgainEvent.events = EPOLLIN | EPOLLET | EPOLLOUT;
+    if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socketFd, &writeAgainEvent) == -1){
+      perror("EPOLL_CTL_MOD for EPOLLOUT failed");
+      exit(1);
+    }
+  }
+}
+
 void network_io(int id){
   const auto toProcessingThread = &toProcessingThreadArray[id];
   const auto fromProcessingThread = &fromProcessingThreadArray[id];
 
-  eventFdArray[id] = eventfd(0, EFD_NONBLOCK);
-  const auto eventFd = eventFdArray[id];
+  eventFdArrayToProcessingThread[id] = eventfd(0, EFD_NONBLOCK);
+  const auto eventFdToProcessingThread = eventFdArrayToProcessingThread[id];
+
+  eventFdArrayFromProcessingThread[id] = eventfd(0, EFD_NONBLOCK);
+  const auto eventFdFromProcessingThread = eventFdArrayFromProcessingThread[id];
   
   wakeUpProcessingThread.counter++; //increment the counter, once it is equal to network thread then wake up the processing thread (if it's asleep), or just let it through
   if(wakeUpProcessingThread.counter == network_threads){
-    uint64_t writeVariable = 1; //write this to the eventfd used to synchronise the threads
     write(wakeUpProcessingThread.eventFd, &writeVariable, sizeof(writeVariable));
   }
 
@@ -155,8 +189,8 @@ void network_io(int id){
   std::memset(&event, 0, sizeof(event));
 
   event.events = EPOLLIN | EPOLLET;
-  event.data.fd = eventFd;
-  if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventFd, &event) == -1){
+  event.data.fd = eventFdFromProcessingThread;
+  if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventFdFromProcessingThread, &event) == -1){
     perror("epoll_ctl eventFd");
     exit(1);
   }
@@ -175,10 +209,10 @@ void network_io(int id){
     event_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
     for(int i = 0; i < event_count; i++){
-      if(events[i].data.fd == eventFd){ //if data has been sent from the processing thread
+      if(events[i].data.fd == eventFdFromProcessingThread){ //if data has been sent from the processing thread
         while(true){
           uint64_t readBuffer;
-          int responseCode = read(eventFd, &readBuffer, sizeof(readBuffer));
+          int responseCode = read(eventFdFromProcessingThread, &readBuffer, sizeof(readBuffer));
           if(responseCode < 0){
             if(errno == EAGAIN || errno == EWOULDBLOCK){ //have read all data
               break;
@@ -187,28 +221,26 @@ void network_io(int id){
 
           itc_s data;
           if(fromProcessingThread->try_dequeue(data)){ //dequeue some data
-            if(liveClientSockets.count(data.socketFd)){ //if it's a valid live client
-              int writtenBytes = write(data.socketFd, &data.payload, sizeof(data.payload));
-              if(writtenBytes == -1){
-                perror("write to client socket failed");
-                exit(1);
-              }else if(writtenBytes != sizeof(data.payload)){
-                residualToSendData.insert({ data.socketFd, data.payload.substr(writtenBytes, sizeof(data.payload))}); //the remaining data is put into here
-                
-                epoll_event writeAgainEvent;
-                writeAgainEvent.data.fd = data.socketFd;
-                writeAgainEvent.events = EPOLLIN | EPOLLET | EPOLLOUT;
-                if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, data.socketFd, &writeAgainEvent) == -1){
-                  perror("EPOLL_CTL_MOD for EPOLLOUT failed");
-                  exit(1);
+            if(liveClientSockets.count(data.socketFd) && data.threadID != -1){ //if it's a valid live client
+              sendMessage(data.socketFd, &data, &residualToSendData, epoll_fd);
+            }else if(data.socketFd == -1 && data.threadID == -1){ //this means it's for broadcast
+              for(const auto &socketFd : liveClientSockets){
+                sendMessage(socketFd, &data, &residualToSendData, epoll_fd);
+              }
+            }else if(data.socketFd != -1 && data.threadID == -1){ //this is the case where we are broadcasting, but excluding one socket
+              for(const auto &socketFd : liveClientSockets){
+                if(socketFd != data.socketFd){
+                  sendMessage(socketFd, &data, &residualToSendData, epoll_fd);
                 }
               }
             }
           }
         }
       }else if(events[i].data.fd == serverFd){ //if there is an incoming connection
+        //std::cout << "got a new connection\n";
         client_size = sizeof(clientAddress);
         clientFd = accept(serverFd, (sockaddr*)&clientAddress, &client_size);
+        //std::cout << "accepted a new connection\n";
 
         if(clientFd < 0){
           if(errno == EAGAIN || errno == EWOULDBLOCK){
@@ -227,6 +259,7 @@ void network_io(int id){
             perror("epoll_ctl failed for a client socket");
             exit(1);
           }
+          //std::cout << "succesfully listening to the new connection\n";
         }
       }else if(events[i].events & EPOLLOUT){ //is this one of the sockets that still needs to write some data?
         auto payload = residualToSendData[events[i].data.fd];
@@ -248,8 +281,10 @@ void network_io(int id){
         std::string buffer;
         while(true){
           char tempBuffer[1024];
+          std::memset(tempBuffer, 0, sizeof(tempBuffer));
+          
           ssize_t readBytes = read(events[i].data.fd, tempBuffer, sizeof(tempBuffer));
-
+          
           if(readBytes == -1){
             if(errno == EAGAIN || EWOULDBLOCK){ //finished reading data
               break;
@@ -263,20 +298,29 @@ void network_io(int id){
             buffer += tempBuffer; //append the read data to the buffer
           }
         }
-
-        toProcessingThread->try_enqueue(itc_s(buffer, events[i].data.fd, id)); //enqueue the buffer data and send it to the processing thread
+        if(buffer.size()){ //so empty messages aren't sent through
+          toProcessingThread->try_enqueue(itc_s(buffer, events[i].data.fd, id)); //enqueue the buffer data and send it to the processing thread
+          write(eventFdToProcessingThread, &writeVariable, sizeof(writeVariable)); //to signal that data has been pushed to the queue
+        }
       }
     }
   }
 }
 
+void broadcast(std::string payload, int socketFd = -1){ //socketFd's are unique to the program, so it can't trigger the exclude-this-socket condition on more than one thread
+  for(int i = 0; i < network_threads; i++){
+    fromProcessingThreadArray[i].try_enqueue(itc_s(payload, socketFd, -1)); //socketFd and thread ID of -1 implies this is for broadcast
+    write(eventFdArrayFromProcessingThread[i], &writeVariable, sizeof(writeVariable));
+  }
+}
+
 int main(){
   std::thread threadContainer[network_threads];
-  uint64_t eventFdWriteVariable = 1;
 
   toProcessingThreadArray = new stringQueue[network_threads];
   fromProcessingThreadArray = new stringQueue[network_threads];
-  eventFdArray = new int[network_threads];
+  eventFdArrayToProcessingThread = new int[network_threads];
+  eventFdArrayFromProcessingThread = new int[network_threads];
 
   /*
   * Use epoll for monitoring eventFdArrray in edge-triggered mode, read data and make all the eventFds non blocking
@@ -317,8 +361,8 @@ int main(){
   epoll_event events[network_threads];
   
   for(int i = 0; i < network_threads; i++){ //register the eventfds
-    const auto eventFd = eventFdArray[i];
-    event.data.fd = eventFd;
+    const auto eventFd = eventFdArrayToProcessingThread[i];
+    event.data.u32 = i; //the thread ID
 
     if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, eventFd, &event) == -1){
       perror("epoll_ctl in processing thread for the eventfds");
@@ -332,7 +376,7 @@ int main(){
     for(int i = 0; i < event_count; i++){
       while(true){
         uint64_t readBytes;
-        int responseCode = read(events[i].data.fd, &readBytes, sizeof(readBytes));
+        int responseCode = read(eventFdArrayToProcessingThread[events[i].data.u32], &readBytes, sizeof(readBytes));
 
         if(responseCode < 0){
           if(errno == EAGAIN || errno == EWOULDBLOCK){ //have read all data
@@ -341,7 +385,7 @@ int main(){
         }
 
         itc_s data;
-        if(toProcessingThreadArray[i].try_dequeue(data)){
+        if(toProcessingThreadArray[events[i].data.u32].try_dequeue(data)){
           /**
            * 
            * Process the data here however you wish
@@ -351,7 +395,9 @@ int main(){
 
           data.payload = someProcessedData;
 
-          fromProcessingThreadArray[i].try_enqueue(data); //sent back to the appropriate thread, for the appropriate socket
+          broadcast(data.payload, data.socketFd); //broadcast function sends it to all threads
+          //fromProcessingThreadArray[events[i].data.u32].try_enqueue(data); //sent back to the appropriate thread, for the appropriate socket
+          //write(eventFdArrayFromProcessingThread[events[i].data.u32], &writeVariable, sizeof(writeVariable)); //notify the thread
         }
       }
     }
