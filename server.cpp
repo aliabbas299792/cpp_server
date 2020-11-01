@@ -1,6 +1,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include <iostream>
 
 #include <unistd.h>
@@ -10,22 +11,13 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #include "libs/readerwriterqueue/readerwriterqueue.h"
 
 #define MAX_EVENTS 10000
 #define PORT "4000"
 #define BACKLOG 100
-
-/*
- *
- * 
- * 
- * Do something to deal with clients disconnecting
- * 
- * 
- * 
-*/
 
 struct itc_s { //itc = inter thread communication struct
   itc_s(std::string payload = "", int socketFd = 0, int threadID = 0){
@@ -74,23 +66,34 @@ struct { //used to synchronise processing thread setting up epoll for eventfd wi
   int counter = 0;
 } wakeUpProcessingThread;
 
-void sendMessage(int socketFd, itc_s *data, std::unordered_map<int, std::string> *residualToSendData, int epoll_fd){
-  int writtenBytes = write(socketFd, data->payload.c_str(), data->payload.size());
-
-  if(writtenBytes == -1){
-    perror("write to client socket failed");
-    exit(1);
-  }else if(writtenBytes != data->payload.size()){
-    residualToSendData->insert({ socketFd, data->payload.substr(writtenBytes, data->payload.size()) }); //the remaining data is put into here
-    
-    epoll_event writeAgainEvent;
-    writeAgainEvent.data.fd = socketFd;
-    writeAgainEvent.events = EPOLLIN | EPOLLET | EPOLLOUT;
-    if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socketFd, &writeAgainEvent) == -1){
-      perror("EPOLL_CTL_MOD for EPOLLOUT failed");
-      exit(1);
+int sendMessage(int socketFd, itc_s *data, std::unordered_set<int> *liveClientSockets, std::unordered_map<int, std::string> *residualToSendData, int epoll_fd){
+  signal(SIGPIPE, SIG_IGN);
+  if(liveClientSockets->count(socketFd)){
+    int writtenBytes = write(socketFd, data->payload.c_str(), data->payload.size());
+    if(writtenBytes == -1){
+      if(errno == EPIPE){ //indicates the socket has disconnected
+        if(epoll_ctl(epoll_fd, EPOLL_CTL_DEL, socketFd, NULL) == -1){
+          perror("epoll_ctl EPOLL_CTL_DEL failed");
+          exit(1);
+        }
+        return 0; //this indicates to delete the socket
+      }else{
+        perror("write to client socket failed");
+        exit(1);
+      }
+    }else if(writtenBytes != data->payload.size()){
+      residualToSendData->insert({ socketFd, data->payload.substr(writtenBytes, data->payload.size()) }); //the remaining data is put into here
+      
+      epoll_event writeAgainEvent;
+      writeAgainEvent.data.fd = socketFd;
+      writeAgainEvent.events = EPOLLIN | EPOLLET | EPOLLOUT;
+      if(epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socketFd, &writeAgainEvent) == -1){
+        perror("EPOLL_CTL_MOD for EPOLLOUT failed");
+        exit(1);
+      }
     }
   }
+  return 1; //this indicates everything proceeded correctly
 }
 
 void network_io(int id){
@@ -162,21 +165,10 @@ void network_io(int id){
     exit(1);
   }
   
-  //std::string ip = toReadableIP((sockaddr_storage*)traverser->ai_addr);
-  //std::cout << ip << "\n";
-  
   if(listen(serverFd, BACKLOG) == -1){ //set this as a listen socket
     perror("listen failed");
     exit(1);
   }
-  
-  /**
-   * Use epoll for monitoring eventFd as well as the listening socket, and the user sockets
-   *  -When eventFd is readable then take the data from the fromProcessingThread queue and send it through the appropriate socket
-   *  -When the listening socket is readable then accept a new connection
-   *  -When a client socket is readable then read some data, and then send it through toProcessingThread, and do a write event on eventFd
-   * Do everything in a non blocking fashion, and use edge-triggered mode for epoll
-   * */
 
   int epoll_fd, event_count;
 
@@ -221,17 +213,20 @@ void network_io(int id){
 
           itc_s data;
           if(fromProcessingThread->try_dequeue(data)){ //dequeue some data
-            if(liveClientSockets.count(data.socketFd) && data.threadID != -1){ //if it's a valid live client
-              sendMessage(data.socketFd, &data, &residualToSendData, epoll_fd);
-            }else if(data.socketFd == -1 && data.threadID == -1){ //this means it's for broadcast
-              for(const auto &socketFd : liveClientSockets){
-                sendMessage(socketFd, &data, &residualToSendData, epoll_fd);
+            if(data.threadID != -1){ //if it's a valid live client
+              if(!sendMessage(data.socketFd, &data, &liveClientSockets, &residualToSendData, epoll_fd)){ //if 0 returned, delete the socket
+                liveClientSockets.erase(data.socketFd);
               }
-            }else if(data.socketFd != -1 && data.threadID == -1){ //this is the case where we are broadcasting, but excluding one socket
+            }else if(data.socketFd == -1 && data.threadID == -1){ //this means it's for broadcast
+              std::vector<int> toDeleteSockets;
               for(const auto &socketFd : liveClientSockets){
-                if(socketFd != data.socketFd){
-                  sendMessage(socketFd, &data, &residualToSendData, epoll_fd);
+                std::cout << "\"" << data.payload << "\" is being sent to socket " << socketFd << "\n";
+                if(!sendMessage(socketFd, &data, &liveClientSockets, &residualToSendData, epoll_fd)){ //if 0 returned, delete the socket
+                  toDeleteSockets.push_back(socketFd);
                 }
+              }
+              for(const auto &socketFd : toDeleteSockets){
+                liveClientSockets.erase(socketFd);
               }
             }
           }
@@ -307,9 +302,9 @@ void network_io(int id){
   }
 }
 
-void broadcast(std::string payload, int socketFd = -1){ //socketFd's are unique to the program, so it can't trigger the exclude-this-socket condition on more than one thread
+void broadcast(std::string payload){
   for(int i = 0; i < network_threads; i++){
-    fromProcessingThreadArray[i].try_enqueue(itc_s(payload, socketFd, -1)); //socketFd and thread ID of -1 implies this is for broadcast
+    fromProcessingThreadArray[i].try_enqueue(itc_s(payload, -1, -1)); //socketFd and thread ID of -1 implies this is for broadcast
     write(eventFdArrayFromProcessingThread[i], &writeVariable, sizeof(writeVariable));
   }
 }
@@ -321,12 +316,6 @@ int main(){
   fromProcessingThreadArray = new stringQueue[network_threads];
   eventFdArrayToProcessingThread = new int[network_threads];
   eventFdArrayFromProcessingThread = new int[network_threads];
-
-  /*
-  * Use epoll for monitoring eventFdArrray in edge-triggered mode, read data and make all the eventFds non blocking
-  * When data comes through, it should be in a structure which indicates what socketFd, and what thread ID it came from
-  * Then once finished, send back data with that information, possibly in a different structure though 
-  * */
 
   for(int i = 0; i < network_threads; i++){
     threadContainer[i] = std::thread(network_io, i);
@@ -395,7 +384,7 @@ int main(){
 
           data.payload = someProcessedData;
 
-          broadcast(data.payload, data.socketFd); //broadcast function sends it to all threads
+          broadcast(data.payload); //broadcast function sends it to all threads
           //fromProcessingThreadArray[events[i].data.u32].try_enqueue(data); //sent back to the appropriate thread, for the appropriate socket
           //write(eventFdArrayFromProcessingThread[events[i].data.u32], &writeVariable, sizeof(writeVariable)); //notify the thread
         }

@@ -12,6 +12,8 @@
 #define PORT "4000"
 #define MAX_DATA_SIZE 1024 //make bytes at once
 
+#define DOMAIN "erewhon.xyz"
+
 int main(){
   int sockfd, numBytes;
   addrinfo hints, *serverInfo, *traverser;
@@ -26,7 +28,7 @@ int main(){
   std::string username;
   std::getline(std::cin, username);
 
-  if((responseCode = getaddrinfo("erewhon.xyz", PORT, &hints, &serverInfo)) != 0){
+  if((responseCode = getaddrinfo(DOMAIN, PORT, &hints, &serverInfo)) != 0){
     perror("getaddrinfo");
     exit(1);
   }
